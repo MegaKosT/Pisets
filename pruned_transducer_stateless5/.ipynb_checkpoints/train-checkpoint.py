@@ -217,7 +217,7 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=30,
+        default=5,
         help="Number of epochs to train.",
     )
 
@@ -461,8 +461,7 @@ def get_params() -> AttributeDict:
     
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    #encoder = Wav2Vec2Model.from_pretrained('bond005/wav2vec2-large-ru-golos')
-    encoder = Wav2Vec2Model.from_pretrained("./wav2vec_pretrained")
+    encoder = Wav2Vec2Model.from_pretrained('bond005/wav2vec2-large-ru-golos')
     return encoder
 
 
@@ -596,8 +595,8 @@ def save_checkpoint(
       scaler:
         The scaler used for mix precision training.
     """
-    if rank != 0:
-        return
+#     if rank != 0:
+#         return
     filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
     save_checkpoint_impl(
         filename=filename,
@@ -622,7 +621,7 @@ def save_checkpoint(
 
 def compute_loss(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    model: nn.Module,
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
@@ -646,17 +645,19 @@ def compute_loss(
      warmup: a floating point value which increases throughout training;
         values >= 1.0 are fully warmed up and have all modules present.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-    audio = batch['audio']
-    feature = audio['input_value']
+    device = next(model.parameters()).device #if isinstance(model, DDP) else next(model.parameters()).device
+    feature = batch['inputs']
+    
+    supervisions = batch["supervisions"]
+    attention_mask = supervisions["attention_mask"]
+    feature_lens = supervisions["input_len"].to(device)
     # at entry, feature is (N, T, C)
     assert feature.ndim == 2#3
     feature = feature.to(device)
+    attention_mask = attention_mask.to(device)
     
-    attention_mask = audio["attention_mask"]
-    feature_lens = audio["input_len"].to(device)
 
-    texts = batch["text"]
+    texts = supervisions["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
@@ -819,10 +820,11 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
-        batch_size = len(batch["text"])
-    
-        with torch.cuda.amp.autocast(enabled=params.use_fp16):
-            loss, loss_info = compute_loss(
+        batch_size = len(batch["supervisions"]["text"])
+
+        try:
+            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                loss, loss_info = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,
@@ -833,29 +835,16 @@ def train_one_epoch(
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
-#         try:
-#             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-#                 loss, loss_info = compute_loss(
-#                     params=params,
-#                     model=model,
-#                     sp=sp,
-#                     batch=batch,
-#                     is_training=True,
-#                     warmup=(params.batch_idx_train / params.model_warm_step),
-#                 )
-#             # summary stats
-#             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
-
-#             # NOTE: We use reduction==sum and loss is computed over utterances
-#             # in the batch and there is no normalization to it so far.
-#             scaler.scale(loss).backward()
-#             scheduler.step_batch(params.batch_idx_train)
-#             scaler.step(optimizer)
-#             scaler.update()
-#             optimizer.zero_grad()
-#         except:  # noqa
-#             display_and_save_batch(batch, params=params, sp=sp)
-#             raise
+            # NOTE: We use reduction==sum and loss is computed over utterances
+            # in the batch and there is no normalization to it so far.
+            scaler.scale(loss).backward()
+            scheduler.step_batch(params.batch_idx_train)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+        except:  # noqa
+            display_and_save_batch(batch, params=params, sp=sp)
+            raise
 
         if params.print_diagnostics and batch_idx == 5:
             return
@@ -967,7 +956,7 @@ def aug_example(audio):
     # Apply effects
     waveform2, sample_rate2 = torchaudio.sox_effects.apply_effects_tensor(waveform1, sample_rate1, effects)
     
-    return waveform2.numpy()
+    return waveform2[0].numpy()
 
 
         
@@ -1001,8 +990,8 @@ def run(args):#rank, world_size, args):
         tb_writer = None
 
     device = torch.device("cpu")
-#     if torch.cuda.is_available():
-#         device = torch.device("cuda")#, rank)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")#, rank)
     logging.info(f"Device: {device}")
 
     sp = spm.SentencePieceProcessor()
@@ -1069,8 +1058,8 @@ def run(args):#rank, world_size, args):
     logging.info("Preparing Dataset")
     dataset = load_dataset("MegaKosT/RuDevSberDS")
     
-    train_ds = dataset['train'].select(range(1000))
-    val_ds = dataset['validation'].select(range(500))
+    train_ds = dataset['train'].select(range(7))
+    val_ds = dataset['validation'].select(range(3))
     
     processor = Wav2Vec2Processor.from_pretrained("bond005/wav2vec2-large-ru-golos")
     
@@ -1083,20 +1072,12 @@ def run(args):#rank, world_size, args):
     
         input_lens = [len(auged_audio) for auged_audio in auged_wavs]
         
-        zipped = []
-        for input_value, attention, input_len in zip(input_values, attention_mask, input_lens):
-            zipped.append({'input_value':input_value, 'attention_mask': attention, "input_len": input_len})
+        supervisions = []
+        for attention, input_len, text in zip(attention_mask, input_lens, batch['transcription']):
+            supervisions.append({'attention_mask': attention, "input_len": input_len, "text": text})
         
-#         text = sp.encode(batch['transcription'])
-        
-#         with processor.as_target_processor():
-#             labels_batch = processor.pad(
-#                 text,
-#                 padding=True,
-#                 return_tensors="pt",
-#             )
     
-        processed_batch = {'audio':zipped, "text": batch['transcription']}
+        processed_batch = {'inputs':input_values, "supervisions": supervisions}
         return processed_batch
     
     
@@ -1109,14 +1090,12 @@ def run(args):#rank, world_size, args):
     
         input_lens = [len(auged_audio) for auged_audio in auged_wavs]
         
-        zipped = []
-        for input_value, attention, input_len in zip(input_values, attention_mask, input_lens):
-            print(len(input_value), len(attention))
-            zipped.append({'input_value':input_value, 'attention_mask': attention, "input_len": input_len})
+        supervisions = []
+        for attention, input_len, text in zip(attention_mask, input_lens, batch['transcription']):
+            supervisions.append({'attention_mask': attention, "input_len": input_len, "text": text})
+        
     
-        #text = sp.encode(batch['transcription'])
-    
-        processed_batch = {'audio':zipped, "text": batch['transcription']}
+        processed_batch = {'inputs':input_values, "supervisions": supervisions}
         return processed_batch
 
 
