@@ -71,6 +71,7 @@ from torch import Tensor
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data.sampler import BatchSampler, RandomSampler
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -217,7 +218,7 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=5,
+        default=30,
         help="Number of epochs to train.",
     )
 
@@ -1054,12 +1055,18 @@ def run(args):#rank, world_size, args):
             2**22
         )  # allow 4 megabytes per sub-module
         diagnostic = diagnostics.attach_diagnostics(model, opts)
+        
+
     
     logging.info("Preparing Dataset")
     dataset = load_dataset("MegaKosT/RuDevSberDS")
     
-    train_ds = dataset['train'].select(range(7))
-    val_ds = dataset['validation'].select(range(3))
+    train_ds = dataset['train'].filter(
+    lambda it2: (it2["transcription"] is not None) and (len(it2["transcription"].strip()) > 0)
+)
+    val_ds = dataset['validation'].filter(
+    lambda it2: (it2["transcription"] is not None) and (len(it2["transcription"].strip()) > 0)
+)
     
     processor = Wav2Vec2Processor.from_pretrained("bond005/wav2vec2-large-ru-golos")
     
@@ -1088,7 +1095,7 @@ def run(args):#rank, world_size, args):
         input_values = processed_audio.input_values
         attention_mask = processed_audio.attention_mask
     
-        input_lens = [len(auged_audio) for auged_audio in auged_wavs]
+        input_lens = [len(auged_audio) for auged_audio in wavs]
         
         supervisions = []
         for attention, input_len, text in zip(attention_mask, input_lens, batch['transcription']):
@@ -1102,9 +1109,13 @@ def run(args):#rank, world_size, args):
     train_ds.set_transform(preproc_train_batch)
     val_ds.set_transform(preproc_val_batch)
     
-    train_dl = DataLoader(train_ds, batch_size=2, shuffle=True)
-    valid_dl = DataLoader(val_ds, shuffle=True)
-    test_iter = iter(valid_dl)
+    
+    train_sampler = BatchSampler(RandomSampler(train_ds), batch_size=4, drop_last=False)
+    train_dl = DataLoader(train_ds, batch_sampler=train_sampler)
+
+    valid_sampler = BatchSampler(RandomSampler(val_ds), batch_size=2, drop_last=False)
+    valid_dl = DataLoader(val_ds, batch_sampler=valid_sampler)
+    
 #     librispeech = LibriSpeechAsrDataModule(args)
 
 #     if params.full_libri:
