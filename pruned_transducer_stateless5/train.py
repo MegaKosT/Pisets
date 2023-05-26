@@ -72,6 +72,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.sampler import BatchSampler, RandomSampler
+from torch.nn.utils import clip_grad_norm_
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -91,7 +92,7 @@ from icefall.utils import (
 )
 
 from datasets import load_dataset
-from transformers import Wav2Vec2Model, Wav2Vec2Processor
+from transformers import Wav2Vec2Model, Wav2Vec2Processor, Wav2Vec2CTCTokenizer
 from torch.utils.data import DataLoader
 import torchaudio
 import random
@@ -218,7 +219,7 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=30,
+        default=10,
         help="Number of epochs to train.",
     )
 
@@ -261,7 +262,7 @@ def get_parser():
     parser.add_argument(
         "--initial-lr",
         type=float,
-        default=0.003,
+        default=0.0001,
         help="The initial learning rate.  This value should not need to be changed.",
     )
 
@@ -623,7 +624,8 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
+    #sp: spm.SentencePieceProcessor,
+    tokenizer: Wav2Vec2CTCTokenizer,
     batch: dict,
     is_training: bool,
     warmup: float = 1.0,
@@ -659,7 +661,8 @@ def compute_loss(
     
 
     texts = supervisions["text"]
-    y = sp.encode(texts, out_type=int)
+    y = tokenizer(texts)['input_ids']
+    #y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
@@ -684,7 +687,7 @@ def compute_loss(
                 f"simple_loss: {simple_loss}\n"
                 f"pruned_loss: {pruned_loss}"
             )
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params, sp=tokenizer)
             simple_loss = simple_loss[simple_loss_is_finite]
             pruned_loss = pruned_loss[pruned_loss_is_finite]
 
@@ -739,7 +742,8 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    sp: spm.SentencePieceProcessor,
+    #sp: spm.SentencePieceProcessor,
+    tokenizer: Wav2Vec2CTCTokenizer,
     valid_dl: torch.utils.data.DataLoader,
 #     world_size: int = 1,
 ) -> MetricsTracker:
@@ -752,7 +756,8 @@ def compute_validation_loss(
         loss, loss_info = compute_loss(
             params=params,
             model=model,
-            sp=sp,
+            #sp=sp,
+            tokenizer=tokenizer,
             batch=batch,
             is_training=False,
         )
@@ -775,7 +780,8 @@ def train_one_epoch(
     model: Optional[nn.Module],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    sp: spm.SentencePieceProcessor,
+    #sp: spm.SentencePieceProcessor,
+    tokenizer: Wav2Vec2CTCTokenizer,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -828,7 +834,7 @@ def train_one_epoch(
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
-                    sp=sp,
+                    tokenizer=tokenizer,
                     batch=batch,
                     is_training=True,
                     warmup=(params.batch_idx_train / params.model_warm_step),
@@ -839,12 +845,13 @@ def train_one_epoch(
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
             scaler.scale(loss).backward()
+            clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
             scheduler.step_batch(params.batch_idx_train)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
         except:  # noqa
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params, sp=tokenizer)
             raise
 
         if params.print_diagnostics and batch_idx == 5:
@@ -873,7 +880,7 @@ def train_one_epoch(
                 params=params,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                sampler=train_dl.sampler,
+                #sampler=train_dl.sampler,
                 scaler=scaler,
 #                 rank=rank,
             )
@@ -907,7 +914,7 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
-                sp=sp,
+                tokenizer=tokenizer,
                 valid_dl=valid_dl,
 #                 world_size=world_size,
             )
@@ -995,12 +1002,13 @@ def run(args):#rank, world_size, args):
         device = torch.device("cuda")#, rank)
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
+#     sp = spm.SentencePieceProcessor()
+#     sp.load(params.bpe_model)
+    processor = Wav2Vec2Processor.from_pretrained("bond005/wav2vec2-large-ru-golos")
 
-    # <blk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.vocab_size = sp.get_piece_size()
+    #  is defined in local/train_bpe_model.py
+    params.blank_id = processor.tokenizer.encode('<pad>')[0]
+    params.vocab_size = processor.tokenizer.vocab_size
 
     if params.dynamic_chunk_training:
         assert (
@@ -1068,7 +1076,6 @@ def run(args):#rank, world_size, args):
     lambda it2: (it2["transcription"] is not None) and (len(it2["transcription"].strip()) > 0)
 )
     
-    processor = Wav2Vec2Processor.from_pretrained("bond005/wav2vec2-large-ru-golos")
     
     def preproc_train_batch(batch):
         auged_wavs = [aug_example(audio) for audio in batch['audio']]
@@ -1113,8 +1120,7 @@ def run(args):#rank, world_size, args):
     train_sampler = BatchSampler(RandomSampler(train_ds), batch_size=4, drop_last=False)
     train_dl = DataLoader(train_ds, batch_sampler=train_sampler)
 
-    valid_sampler = BatchSampler(RandomSampler(val_ds), batch_size=2, drop_last=False)
-    valid_dl = DataLoader(val_ds, batch_sampler=valid_sampler)
+    valid_dl = DataLoader(val_ds, batch_size=2)
     
 #     librispeech = LibriSpeechAsrDataModule(args)
 
@@ -1208,7 +1214,7 @@ def run(args):#rank, world_size, args):
             #model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            sp=sp,
+            tokenizer=processor.tokenizer,
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
@@ -1243,7 +1249,8 @@ def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    sp: spm.SentencePieceProcessor,
+    tokenizer: Wav2Vec2CTCTokenizer,
+#     sp: spm.SentencePieceProcessor,
     params: AttributeDict,
     warmup: float,
 ):
@@ -1260,7 +1267,7 @@ def scan_pessimistic_batches_for_oom(
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
-                    sp=sp,
+                    tokenizer=tokenizer,
                     batch=batch,
                     is_training=True,
                     warmup=warmup,
@@ -1277,7 +1284,7 @@ def scan_pessimistic_batches_for_oom(
                     f"Failing criterion: {criterion} "
                     f"(={crit_values[criterion]}) ..."
                 )
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params, sp=tokenizer)
             raise
 
 

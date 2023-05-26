@@ -106,7 +106,7 @@ def get_parser():
     parser.add_argument(
         "--method",
         type=str,
-        default="greedy_search",
+        default="beam_search",
         help="""Possible values are:
           - greedy_search
           - beam_search
