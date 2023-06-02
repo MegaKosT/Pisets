@@ -30,10 +30,12 @@ class Joiner(nn.Module):
         vocab_size: int,
     ):
         super().__init__()
-
-        self.encoder_proj = ScaledLinear(encoder_dim, joiner_dim)
-        self.decoder_proj = ScaledLinear(decoder_dim, joiner_dim)
-        self.output_linear = ScaledLinear(joiner_dim, vocab_size)
+#         self.encoder_proj = ScaledLinear(encoder_dim, joiner_dim)
+#         self.decoder_proj = ScaledLinear(decoder_dim, joiner_dim)
+#         self.output_linear = ScaledLinear(joiner_dim, vocab_size)
+        self.encoder_proj = nn.Linear(encoder_dim, joiner_dim)
+        self.decoder_proj = nn.Linear(decoder_dim, joiner_dim)
+        self.output_linear = nn.Linear(joiner_dim, vocab_size)
 
     def forward(
         self,

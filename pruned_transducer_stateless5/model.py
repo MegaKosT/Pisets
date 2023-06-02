@@ -133,8 +133,7 @@ class Transducer(nn.Module):
         assert y.num_axes == 2, y.num_axes
         
         #assert x.size(0) == x_lens.size(0) == y.dim0
-        encoder_out = self.encoder(input_values=x, attention_mask=attention_mask).extract_features
-        
+        encoder_out = self.encoder(input_values=x, attention_mask=attention_mask).last_hidden_state
         #assert torch.all(x_lens > 0)
         # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
@@ -154,6 +153,7 @@ class Transducer(nn.Module):
         y_padded = y.pad(mode="constant", padding_value=0)
 
         y_padded = y_padded.to(torch.int64)
+       
         boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=x.device)
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
@@ -196,7 +196,6 @@ class Transducer(nn.Module):
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-
         with torch.cuda.amp.autocast(enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),

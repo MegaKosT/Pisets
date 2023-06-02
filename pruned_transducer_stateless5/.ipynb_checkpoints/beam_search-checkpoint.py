@@ -37,6 +37,7 @@ from icefall.utils import (
     get_texts_with_timestamp,
 )
 
+from transformers import Wav2Vec2CTCTokenizer
 
 def fast_beam_search_one_best(
     model: Transducer,
@@ -1553,7 +1554,8 @@ def fast_beam_search_with_nbest_rescoring(
     ngram_lm_scale_list: List[float],
     num_paths: int,
     G: k2.Fsa,
-    sp: spm.SentencePieceProcessor,
+    sp: Wav2Vec2CTCTokenizer,
+#     sp: spm.SentencePieceProcessor,
     word_table: k2.SymbolTable,
     oov_word: str = "<UNK>",
     use_double_scores: bool = True,
@@ -1643,7 +1645,7 @@ def fast_beam_search_with_nbest_rescoring(
     tokens = tokens.remove_values_leq(0)  # remove -1 and 0
 
     token_list: List[List[int]] = tokens.tolist()
-    word_list: List[List[str]] = sp.decode(token_list)
+    word_list: List[List[str]] = sp.batch_decode(token_list)
 
     assert isinstance(oov_word, str), oov_word
     assert oov_word in word_table, oov_word
@@ -1713,11 +1715,12 @@ def fast_beam_search_with_nbest_rnn_rescoring(
     ngram_lm_scale_list: List[float],
     num_paths: int,
     G: k2.Fsa,
-    sp: spm.SentencePieceProcessor,
+    sp: Wav2Vec2CTCTokenizer,
+    #sp: spm.SentencePieceProcessor,
     word_table: k2.SymbolTable,
     rnn_lm_model: torch.nn.Module,
     rnn_lm_scale_list: List[float],
-    oov_word: str = "<UNK>",
+    oov_word: str = "<unk>",
     use_double_scores: bool = True,
     nbest_scale: float = 0.5,
     temperature: float = 1.0,
@@ -1809,7 +1812,7 @@ def fast_beam_search_with_nbest_rnn_rescoring(
     tokens = tokens.remove_values_leq(0)  # remove -1 and 0
 
     token_list: List[List[int]] = tokens.tolist()
-    word_list: List[List[str]] = sp.decode(token_list)
+    word_list: List[List[str]] = sp.batch_decode(token_list)
 
     assert isinstance(oov_word, str), oov_word
     assert oov_word in word_table, oov_word
@@ -1854,8 +1857,8 @@ def fast_beam_search_with_nbest_rnn_rescoring(
 
     # Now RNN-LM
     blank_id = model.decoder.blank_id
-    sos_id = sp.piece_to_id("sos_id")
-    eos_id = sp.piece_to_id("eos_id")
+    sos_id = sp.encode("<s>")[0]
+    eos_id = sp.encode("</s>")[0]
 
     sos_tokens = add_sos(tokens, sos_id)
     tokens_eos = add_eos(tokens, eos_id)

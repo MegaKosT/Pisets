@@ -73,6 +73,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.nn.utils import clip_grad_norm_
+from torch.optim import Adamax
+from torch.optim.lr_scheduler import CyclicLR
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -92,12 +94,13 @@ from icefall.utils import (
 )
 
 from datasets import load_dataset
-from transformers import Wav2Vec2Model, Wav2Vec2Processor, Wav2Vec2CTCTokenizer
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Wav2Vec2CTCTokenizer
 from torch.utils.data import DataLoader
 import torchaudio
 import random
+import numpy as np
 
-LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler, CyclicLR]
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
@@ -125,7 +128,7 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--encoder-dim",
         type=int,
-        default=512,
+        default=1024,
         help="Attention dimension in the conformer encoder layer.",
     )
 
@@ -219,14 +222,14 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=10,
+        default=50,
         help="Number of epochs to train.",
     )
 
     parser.add_argument(
         "--start-epoch",
         type=int,
-        default=1,
+        default=4,
         help="""Resume training from this epoch. It should be positive.
         If larger than 1, it will load checkpoint from
         exp-dir/epoch-{start_epoch-1}.pt
@@ -262,7 +265,7 @@ def get_parser():
     parser.add_argument(
         "--initial-lr",
         type=float,
-        default=0.0001,
+        default=0.001,
         help="The initial learning rate.  This value should not need to be changed.",
     )
 
@@ -285,7 +288,7 @@ def get_parser():
     parser.add_argument(
         "--context-size",
         type=int,
-        default=2,
+        default=8,
         help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
     )
 
@@ -339,7 +342,7 @@ def get_parser():
     parser.add_argument(
         "--save-every-n",
         type=int,
-        default=4000,
+        default=3000,
         help="""Save checkpoint after processing this number of batches"
         periodically. We save checkpoint to exp-dir/ whenever
         params.batch_idx_train % save_every_n == 0. The checkpoint filename
@@ -463,7 +466,7 @@ def get_params() -> AttributeDict:
     
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    encoder = Wav2Vec2Model.from_pretrained('bond005/wav2vec2-large-ru-golos')
+    encoder = Wav2Vec2ForCTC.from_pretrained("bond005/wav2vec2-large-ru-golos").wav2vec2
     return encoder
 
 
@@ -709,6 +712,7 @@ def compute_loss(
         pruned_loss_scale = (
             0.0 if warmup < 1.0 else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
         )
+        scaled_pruned = pruned_loss_scale * pruned_loss
         loss = params.simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
 
     assert loss.requires_grad == is_training
@@ -774,6 +778,20 @@ def compute_validation_loss(
 
     return tot_loss
 
+def get_grad_norm(parameters, print_all_grads=False):
+    total_norm = 0
+    for p in parameters:
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+            
+            if print_all_grads:
+                print(param_norm)
+        else:
+            total_norm += 0
+    
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
 
 def train_one_epoch(
     params: AttributeDict,
@@ -838,16 +856,24 @@ def train_one_epoch(
                     batch=batch,
                     is_training=True,
                     warmup=(params.batch_idx_train / params.model_warm_step),
-                )
+                    )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
             scaler.scale(loss).backward()
-            clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
-            scheduler.step_batch(params.batch_idx_train)
+            scaler.unscale_(optimizer)
+           # clip_grad_norm_(model.parameters(), max_norm=200, norm_type=2.0)
+            
+            if batch_idx % params.log_interval == 0:
+                
+                total_norm = get_grad_norm(model.parameters())
+
+            
+            #scheduler.step_batch(params.batch_idx_train)
             scaler.step(optimizer)
+            scheduler.step_batch(params.batch_idx_train)
             scaler.update()
             optimizer.zero_grad()
         except:  # noqa
@@ -880,7 +906,7 @@ def train_one_epoch(
                 params=params,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                #sampler=train_dl.sampler,
+               # sampler=train_dl.sampler,
                 scaler=scaler,
 #                 rank=rank,
             )
@@ -896,7 +922,10 @@ def train_one_epoch(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
                 f"tot_loss[{tot_loss}], batch size: {batch_size}, "
-                f"lr: {cur_lr:.2e}"
+                f"lr: {cur_lr:.2e}, "
+#                 f"encoder_norm: {encoder_norm}, "
+#                 f"decoder_norm: {decoder_norm}, "
+                f"total_norm: {total_norm}, "
             )
 
             if tb_writer is not None:
@@ -908,6 +937,12 @@ def train_one_epoch(
                     tb_writer, "train/current_", params.batch_idx_train
                 )
                 tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
+                
+                tb_writer.add_scalar(
+                    'train/gradient_norm', total_norm, params.batch_idx_train
+                )
+                
+                
 
         if batch_idx > 0 and batch_idx % params.valid_interval == 0:
             logging.info("Computing validation loss")
@@ -936,7 +971,7 @@ def train_one_epoch(
 def get_effects(sample_rate):
     all_effects = [
         {'effect':[["treble", f"{random.randint(-100,100)}"]], 'prob': 0.3},
-        {'effect':random.choices([["tempo", f"{random.randint(50,150)/100}"], ["speed", f"{random.randint(50,150)/100}"]], k=1), 'prob': 0.7},
+        {'effect':random.choices([["tempo", f"{random.randint(90,110)/100}"], ["speed", f"{random.randint(90,110)/100}"]], k=1), 'prob': 0.7},
         {'effect':[["reverb", "-w", "1"],["channels", "1"]], 'prob': 0.3},
         {'effect':[["pitch", f"{random.randint(-700,700)}"]], 'prob': 0.7},
         {'effect':[["lowpass", "-1", f"{random.uniform(0.01,500)}"]], 'prob': 0.5},
@@ -953,13 +988,11 @@ def get_effects(sample_rate):
     return probed_effects
 
 
-def aug_example(audio):
+def aug_example(audio, effects):
     # Load the data
-    waveform1 = torch.Tensor([audio.get('array')])
+    waveform1 = torch.unsqueeze(torch.Tensor(audio.get('array')), 0)
     sample_rate1 = audio.get('sampling_rate')
-    
-    # Define effects
-    effects = get_effects(sample_rate1)
+
 
     # Apply effects
     waveform2, sample_rate2 = torchaudio.sox_effects.apply_effects_tensor(waveform1, sample_rate1, effects)
@@ -1038,9 +1071,17 @@ def run(args):#rank, world_size, args):
 #         logging.info("Using DDP")
 #         model = DDP(model, device_ids=[rank])
 
-    optimizer = Eve(model.parameters(), lr=params.initial_lr)
+    optimizer = Adamax(model.parameters(), lr=params.initial_lr)
 
+#     scheduler = CyclicLR(optimizer, 
+#                          base_lr = 0.000001,
+#                          max_lr = params.initial_lr,
+#                          step_size_up = 32, 
+#                          mode = "triangular2",
+#                          cycle_momentum=False,
+#                         )
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+
     
                 
     model.to(device)
@@ -1067,7 +1108,7 @@ def run(args):#rank, world_size, args):
 
     
     logging.info("Preparing Dataset")
-    dataset = load_dataset("MegaKosT/RuDevSberDS")
+    dataset = load_dataset("MegaKosT/RuDevSberDS").with_format('torch')
     
     train_ds = dataset['train'].filter(
     lambda it2: (it2["transcription"] is not None) and (len(it2["transcription"].strip()) > 0)
@@ -1078,7 +1119,8 @@ def run(args):#rank, world_size, args):
     
     
     def preproc_train_batch(batch):
-        auged_wavs = [aug_example(audio) for audio in batch['audio']]
+        effects = get_effects(16000)
+        auged_wavs = [aug_example(audio, effects) for audio in batch['audio']]
     
         processed_audio = processor(auged_wavs, padding=True, return_tensors='pt', sampling_rate=16000)
         input_values = processed_audio.input_values
@@ -1117,10 +1159,19 @@ def run(args):#rank, world_size, args):
     val_ds.set_transform(preproc_val_batch)
     
     
-    train_sampler = BatchSampler(RandomSampler(train_ds), batch_size=4, drop_last=False)
+    
+    train_sampler = BatchSampler(RandomSampler(train_ds), batch_size=8, drop_last=False)
+    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+        # We only load the sampler's state dict when it loads a checkpoint
+        # saved in the middle of an epoch
+        #sampler_state_dict = checkpoints["sampler"]
+        train_sampler.load_state_dict(checkpoints["sampler"])
+#     else:
+#         sampler_state_dict = None
+
     train_dl = DataLoader(train_ds, batch_sampler=train_sampler)
 
-    valid_dl = DataLoader(val_ds, batch_size=2)
+    valid_dl = DataLoader(val_ds, batch_size=8)
     
 #     librispeech = LibriSpeechAsrDataModule(args)
 
@@ -1168,12 +1219,7 @@ def run(args):#rank, world_size, args):
 
 #     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
-#     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-#         # We only load the sampler's state dict when it loads a checkpoint
-#         # saved in the middle of an epoch
-#         sampler_state_dict = checkpoints["sampler"]
-#     else:
-#         sampler_state_dict = None
+
 
 #     train_dl = librispeech.train_dataloaders(
 #         train_cuts, sampler_state_dict=sampler_state_dict
@@ -1184,11 +1230,13 @@ def run(args):#rank, world_size, args):
 #     valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
 #     if params.start_batch <= 0 and not params.print_diagnostics:
+#         logging.info("Scanning pessimistic batches")
 #         scan_pessimistic_batches_for_oom(
 #             model=model,
 #             train_dl=train_dl,
 #             optimizer=optimizer,
-#             sp=sp,
+#             tokenizer=processor.tokenizer,
+#             #sp=sp,
 #             params=params,
 #             warmup=0.0 if params.start_epoch == 1 else 1.0,
 #         )
@@ -1222,7 +1270,7 @@ def run(args):#rank, world_size, args):
 #             world_size=world_size,
 #             rank=rank,
         )
-
+            
         if params.print_diagnostics:
             diagnostic.print_diagnostics()
             break
@@ -1259,6 +1307,7 @@ def scan_pessimistic_batches_for_oom(
     logging.info(
         "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
     )
+    print(train_dl.sampler)
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]

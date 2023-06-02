@@ -91,7 +91,7 @@ def get_parser():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=None,
+        default='./pruned_transducer_stateless5/exp/checkpoint-4000.pt',
         help="Path to the checkpoint. "
         "The checkpoint is assumed to be saved by "
         "icefall.checkpoint.save_checkpoint().",
@@ -100,6 +100,7 @@ def get_parser():
     parser.add_argument(
         "--bpe-model",
         type=str,
+        default=None,
         help="""Path to bpe.model.""",
     )
 
@@ -168,7 +169,7 @@ def get_parser():
     parser.add_argument(
         "--context-size",
         type=int,
-        default=2,
+        default=8,
         help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
     )
     parser.add_argument(
@@ -218,13 +219,14 @@ def main():
 
     params.update(vars(args))
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
+#     sp = spm.SentencePieceProcessor()
+#     sp.load(params.bpe_model)
+    processor = transformers.Wav2Vec2Processor.from_pretrained("bond005/wav2vec2-large-ru-golos")
 
     # <blk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.unk_id = sp.piece_to_id("<unk>")
-    params.vocab_size = sp.get_piece_size()
+    params.blank_id = processor.tokenizer.encode("<pad>")[0]
+    params.unk_id = processor.tokenizer.encode("<unk>")[0]
+    params.vocab_size = processor.tokenizer.vocab_size
 
 
     logging.info(f"{params}")
@@ -248,7 +250,6 @@ def main():
     model.eval()
     model.device = device
     
-    processor = transformers.Wav2Vec2Processor.from_pretrained("bond005/wav2vec2-large-ru-golos")
 
     #logging.info("Constructing Fbank computer")
     #opts = kaldifeat.FbankOptions()
@@ -306,8 +307,10 @@ def main():
             max_contexts=params.max_contexts,
             max_states=params.max_states,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+        for hyp in hyp_tokens:
+            hyps.append(processor.tokenizer.decode(hyp).split())
+#         for hyp in processor.sp.decode(hyp_tokens):
+#             hyps.append(hyp.split())
     elif params.method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
@@ -315,17 +318,20 @@ def main():
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        print('hyp0:', hyp_tokens[0][0], sp.decode(hyp_tokens[0][0]))
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+        for hyp in hyp_tokens:
+            hyps.append(processor.tokenizer.decode(hyp).split())
+#         for hyp in sp.decode(hyp_tokens):
+#             hyps.append(hyp.split())
     elif params.method == "greedy_search" and params.max_sym_per_frame == 1:
         hyp_tokens = greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+        for hyp in hyp_tokens:
+            hyps.append(processor.tokenizer.decode(hyp).split())
+#         for hyp in sp.decode(hyp_tokens):
+#             hyps.append(hyp.split())
     else:
         for i in range(num_waves):
             # fmt: off
@@ -345,8 +351,9 @@ def main():
                 )
             else:
                 raise ValueError(f"Unsupported method: {params.method}")
-            
-            hyps.append(sp.decode(hyp).split())
+            print(hyp)
+            #hyps.append(processor.tokenizer.decode(hyp).split())
+#             hyps.append(sp.decode(hyp).split())
     
     s = "\n"
     for filename, hyp in zip(params.sound_files, hyps):

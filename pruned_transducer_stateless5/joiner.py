@@ -30,7 +30,6 @@ class Joiner(nn.Module):
         vocab_size: int,
     ):
         super().__init__()
-
         self.encoder_proj = ScaledLinear(encoder_dim, joiner_dim)
         self.decoder_proj = ScaledLinear(decoder_dim, joiner_dim)
         self.output_linear = ScaledLinear(joiner_dim, vocab_size)
